@@ -140,6 +140,15 @@ async function gitConfigValue(key: string, dir: string): Promise<string | undefi
   }
 }
 
+const FILTER_CONFIG_KEYS = [
+  "filter.omp-config-sync-yaml.clean",
+  "filter.omp-config-sync-yaml.smudge",
+  "filter.omp-config-sync-yaml.required",
+  "filter.omp-config-sync-json.clean",
+  "filter.omp-config-sync-json.smudge",
+  "filter.omp-config-sync-json.required",
+];
+
 async function resolveNodeExecutable(): Promise<string | undefined> {
   if (/^node(\.exe)?$/i.test(path.basename(process.execPath))) return process.execPath;
   const names = process.platform === "win32" ? ["node.exe", "node.cmd"] : ["node"];
@@ -158,13 +167,22 @@ function formatFilterCommand(nodeExec: string, scriptPath: string, mode: string,
   return `"${node}" "${script}" ${mode} ${format}`;
 }
 
-export async function ensureFilter(dir: string, config: OmpSyncConfig = {}): Promise<void> {
+export async function ensureFilter(
+  dir: string,
+  config: OmpSyncConfig = {},
+  findNode: () => Promise<string | undefined> = resolveNodeExecutable
+): Promise<void> {
   if (!(await hasDotGit(dir))) return;
 
   // Never use process.execPath here: inside omp it is omp.exe, so every git filter
   // call would start a full agent session.
-  const nodeExec = await resolveNodeExecutable();
-  if (!nodeExec) return;
+  const nodeExec = await findNode();
+  if (!nodeExec) {
+    // Without a clean filter, machine-local keys would be committed in plaintext.
+    // Drop any stale filter config (e.g. one pointing at omp.exe) and fail loudly.
+    for (const k of FILTER_CONFIG_KEYS) await git(["config", "--unset-all", k], dir).catch(() => {});
+    throw new Error("node executable not found on PATH; omp-sync git filters were removed and sync is blocked");
+  }
 
   await fs.mkdir(stateDir(dir), { recursive: true });
   const scriptPath = path.join(stateDir(dir), "filter.mjs");

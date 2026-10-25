@@ -54,3 +54,14 @@ test("ensureFilter points git filters at node, never at omp.exe", async () => {
   assert.doesNotMatch(stdout, /omp(\.exe)?"/i);
   assert.match(stdout, /node(\.exe)?"/i);
 });
+
+test("ensureFilter fails closed and unsets stale filters when node is missing", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-filter-nonode-"));
+  await sh("git", ["init", "-b", "main"], root);
+  await sh("git", ["config", "filter.omp-config-sync-json.clean", "C:/omp.exe x.mjs clean json"], root);
+
+  await assert.rejects(ensureFilter(root, {}, async () => undefined), /node executable not found/);
+
+  const after = await sh("git", ["config", "--get", "filter.omp-config-sync-json.clean"], root).catch((e) => e);
+  assert.equal(after.code, 1);
+});
