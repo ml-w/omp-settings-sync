@@ -140,14 +140,31 @@ async function gitConfigValue(key: string, dir: string): Promise<string | undefi
   }
 }
 
-function formatFilterCommand(scriptPath: string, mode: string, format: string): string {
-  const nodeExec = process.execPath.replaceAll("\\", "/");
+async function resolveNodeExecutable(): Promise<string | undefined> {
+  if (/^node(\.exe)?$/i.test(path.basename(process.execPath))) return process.execPath;
+  const names = process.platform === "win32" ? ["node.exe", "node.cmd"] : ["node"];
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (await fs.access(candidate).then(() => true, () => false)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+function formatFilterCommand(nodeExec: string, scriptPath: string, mode: string, format: string): string {
+  const node = nodeExec.replaceAll("\\", "/");
   const script = scriptPath.replaceAll("\\", "/");
-  return `"${nodeExec}" "${script}" ${mode} ${format}`;
+  return `"${node}" "${script}" ${mode} ${format}`;
 }
 
 export async function ensureFilter(dir: string, config: OmpSyncConfig = {}): Promise<void> {
   if (!(await hasDotGit(dir))) return;
+
+  // Never use process.execPath here: inside omp it is omp.exe, so every git filter
+  // call would start a full agent session.
+  const nodeExec = await resolveNodeExecutable();
+  if (!nodeExec) return;
 
   await fs.mkdir(stateDir(dir), { recursive: true });
   const scriptPath = path.join(stateDir(dir), "filter.mjs");
@@ -162,11 +179,11 @@ export async function ensureFilter(dir: string, config: OmpSyncConfig = {}): Pro
   }
 
   const configs: Record<string, string> = {
-    "filter.omp-config-sync-yaml.clean": formatFilterCommand(scriptPath, "clean", "yaml"),
-    "filter.omp-config-sync-yaml.smudge": formatFilterCommand(scriptPath, "smudge", "yaml"),
+    "filter.omp-config-sync-yaml.clean": formatFilterCommand(nodeExec, scriptPath, "clean", "yaml"),
+    "filter.omp-config-sync-yaml.smudge": formatFilterCommand(nodeExec, scriptPath, "smudge", "yaml"),
     "filter.omp-config-sync-yaml.required": "false",
-    "filter.omp-config-sync-json.clean": formatFilterCommand(scriptPath, "clean", "json"),
-    "filter.omp-config-sync-json.smudge": formatFilterCommand(scriptPath, "smudge", "json"),
+    "filter.omp-config-sync-json.clean": formatFilterCommand(nodeExec, scriptPath, "clean", "json"),
+    "filter.omp-config-sync-json.smudge": formatFilterCommand(nodeExec, scriptPath, "smudge", "json"),
     "filter.omp-config-sync-json.required": "false",
   };
 

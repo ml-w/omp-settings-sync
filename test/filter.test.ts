@@ -44,3 +44,13 @@ test("filter cleans machine keys and smudges them back for YAML config", async (
   assert.match(smudgeResult, /shellPath/);
   assert.match(smudgeResult, /titanium/);
 });
+
+test("ensureFilter points git filters at node, never at omp.exe", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-filter-node-"));
+  await sh("git", ["init", "-b", "main"], root);
+  await ensureFilter(root, {});
+
+  const { stdout } = await sh("git", ["config", "--get", "filter.omp-config-sync-json.clean"], root);
+  assert.doesNotMatch(stdout, /omp(\.exe)?"/i);
+  assert.match(stdout, /node(\.exe)?"/i);
+});
