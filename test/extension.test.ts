@@ -22,8 +22,8 @@ test("extension registers /ompsync command and session listeners", () => {
 
   assert.ok(commands["ompsync"]);
   assert.ok(commands["gitsync"]);
-  assert.ok(events["session_start"]?.length);
-  assert.ok(events["session_shutdown"]?.length);
+  assert.equal(events["session_start"], undefined);
+  assert.equal(events["session_shutdown"], undefined);
 
   const def = commands["ompsync"] as { getArgumentCompletions(prefix: string): Array<{ value: string }> | null };
   const rootCompletions = def.getArgumentCompletions("sy");

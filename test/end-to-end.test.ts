@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { git } from "../src/git.js";
-import { checkAndBackgroundSync, runInit, runLink, runSync, runUnlockVault, showStatus } from "../src/sync.js";
+import { runInit, runLink, runSync, runUnlockVault, showStatus } from "../src/sync.js";
 
 import { getVaultStatus } from "../src/vault.js";
 import { createBareRemote, createFakeGh, createMachineFixture } from "./helpers.js";
@@ -38,29 +38,22 @@ test("end-to-end round trip: init machine A, link machine B, sync bidirectional 
   );
 });
 
-test("checkAndBackgroundSync detects local changes and syncs them automatically", async () => {
-  const a = await createMachineFixture("bg-sync-a");
+test("manual runSync commits local changes and syncs them to another machine", async () => {
+  const a = await createMachineFixture("manual-sync-a");
   const remote = await createBareRemote(a.root);
   const ghA = createFakeGh();
 
   await runInit(remote, undefined, { dir: a.dir, gh: ghA });
 
-  // No changes -> returns false
-  const syncedWithoutChanges = await checkAndBackgroundSync(undefined, { dir: a.dir });
-  assert.equal(syncedWithoutChanges, false);
+  await fs.writeFile(path.join(a.dir, "AGENTS.md"), "# Manually synced changes\n");
+  await runSync(undefined, { auto: false, push: true }, { dir: a.dir });
 
-  // Add change -> returns true and commits/pushes
-  await fs.writeFile(path.join(a.dir, "AGENTS.md"), "# Background synced changes\n");
-  const syncedWithChanges = await checkAndBackgroundSync(undefined, { dir: a.dir });
-  assert.equal(syncedWithChanges, true);
-
-  // Link on Machine B and verify change was synced
-  const b = await createMachineFixture("bg-sync-b");
+  const b = await createMachineFixture("manual-sync-b");
   const ghB = createFakeGh();
   await runLink(remote, undefined, { dir: b.dir, gh: ghB });
   assert.equal(
     (await fs.readFile(path.join(b.dir, "AGENTS.md"), "utf8")).replace(/\r\n/g, "\n"),
-    "# Background synced changes\n"
+    "# Manually synced changes\n"
   );
 });
 

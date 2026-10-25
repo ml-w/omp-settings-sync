@@ -1,11 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Ctx, Deps } from "./config.js";
-import { dirOf, readConfig } from "./config.js";
-import { isSyncableRepo } from "./git.js";
-
-export const DEFAULT_AUTO_SYNC_INTERVAL_MINUTES = 1;
-export const DEFAULT_REMOTE_CHECK_INTERVAL_MINUTES = 5;
+import { dirOf } from "./config.js";
 
 const inProcessMutex = new Map<string, Promise<void>>();
 
@@ -30,60 +26,11 @@ export function lockPath(dir: string): string {
   return path.join(stateDir(dir), "lock");
 }
 
-export function statePath(dir: string): string {
-  return path.join(stateDir(dir), "state.json");
-}
-
 export function isSubagentChild(): boolean {
   if (Number(process.env.PI_SUBAGENT_DEPTH ?? "0") > 0) return true;
   if (Number(process.env.OMP_SUBAGENT_DEPTH ?? "0") > 0) return true;
   if (process.env.OMP_IS_SUBAGENT === "true" || process.env.OMP_IS_SUBAGENT === "1") return true;
   return false;
-}
-
-export interface SyncState {
-  lastAutoSyncAt?: string;
-  lastRemoteCheckAt?: string;
-}
-
-export async function readSyncState(dir: string): Promise<SyncState> {
-  try {
-    const raw = await fs.readFile(statePath(dir), "utf8");
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === "object") {
-      return parsed as SyncState;
-    }
-    return {};
-  } catch {
-    return {};
-  }
-}
-
-export async function writeSyncState(state: Partial<SyncState>, dir = dirOf()): Promise<void> {
-  await fs.mkdir(stateDir(dir), { recursive: true });
-  const current = await readSyncState(dir);
-  const next = { ...current, ...state };
-  await fs.writeFile(statePath(dir), JSON.stringify(next, null, 2) + "\n");
-}
-
-export async function shouldAutoSync(deps?: Deps): Promise<boolean> {
-  const dir = dirOf(deps);
-  if (isSubagentChild() || !(await isSyncableRepo(dir))) return false;
-
-  const state = await readSyncState(dir);
-  if (!state.lastAutoSyncAt) return true;
-
-  const config = await readConfig(deps);
-  const intervalMs = (config.autoSyncIntervalMinutes ?? DEFAULT_AUTO_SYNC_INTERVAL_MINUTES) * 60_000;
-  return Date.now() - Date.parse(state.lastAutoSyncAt) >= intervalMs;
-}
-
-export async function shouldCheckRemote(deps?: Deps, minIntervalMinutes = DEFAULT_REMOTE_CHECK_INTERVAL_MINUTES): Promise<boolean> {
-  const dir = dirOf(deps);
-  const state = await readSyncState(dir);
-  if (!state.lastRemoteCheckAt) return true;
-  const intervalMs = minIntervalMinutes * 60_000;
-  return Date.now() - Date.parse(state.lastRemoteCheckAt) >= intervalMs;
 }
 
 function isProcessAlive(pid: number): boolean {

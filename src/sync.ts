@@ -12,18 +12,14 @@ import {
   getSyncDivergence,
   git,
   gitRaw,
-  hasAnyChanges,
   hasCommits,
   hasDotGit,
-  hasLocalChanges,
-  hasRemoteChanges,
   integrateUpstream,
   isRemoteReachable,
   isSyncableRepo,
   pushOrigin,
   upstreamRef,
 } from "./git.js";
-import { isSubagentChild, shouldCheckRemote, withLock, writeSyncState } from "./lock.js";
 
 import {
   ensureIgnoreRules,
@@ -687,37 +683,6 @@ export async function runSync(
     clearSyncProgress(ctx);
   }
 }
-
-export async function checkAndBackgroundSync(ctx: Ctx, deps?: Deps): Promise<boolean> {
-  const dir = dirOf(deps);
-  if (isSubagentChild() || !(await isSyncableRepo(dir))) return false;
-
-  const localChanges = await hasLocalChanges(dir);
-  const config = await readConfig(deps, ctx);
-  const checkRemote = localChanges || (await shouldCheckRemote(deps, config.autoSyncIntervalMinutes ?? 5));
-
-  if (!localChanges && !checkRemote) return false;
-
-  const hasChanges = localChanges || (await hasRemoteChanges(dir));
-  if (checkRemote) {
-    await writeSyncState({ lastRemoteCheckAt: new Date().toISOString() }, dir).catch(() => {});
-  }
-
-  if (!hasChanges) return false;
-
-  const ran = await withLock(
-    ctx,
-    async () => {
-      await writeSyncState({ lastAutoSyncAt: new Date().toISOString(), lastRemoteCheckAt: new Date().toISOString() }, dir);
-      await runSync(ctx, { auto: true, push: true }, deps);
-      return true;
-    },
-    deps
-  );
-
-  return ran === true;
-}
-
 
 export async function runUnlockVault(passwordArg?: string, ctx?: Ctx, deps?: Deps): Promise<void> {
   const dir = dirOf(deps);

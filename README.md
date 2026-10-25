@@ -4,7 +4,7 @@
 [![CI](https://github.com/aaxyat/omp-settings-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/aaxyat/omp-settings-sync/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Securely sync your [Oh My Pi](https://omp.sh) (`~/.omp/agent`) configuration, session tokens, and login credentials across devices (Linux, macOS, Windows) through a private Git remote (`OhMyPiSyncData`) — automatically, with 4-tier guards keeping plaintext secrets, databases, and runtime state out.
+Securely sync your [Oh My Pi](https://omp.sh) (`~/.omp/agent`) configuration, session tokens, and login credentials across devices (Linux, macOS, Windows) through a private Git remote (`OhMyPiSyncData`) — on demand via `/ompsync`, with 4-tier guards keeping plaintext secrets, databases, and runtime state out.
 
 The agent directory (`~/.omp/agent` or `~/.omp/profiles/<profile>/agent`) **is** the repository, ensuring transparent version history with zero shadow staging copies.
 
@@ -13,8 +13,6 @@ The agent directory (`~/.omp/agent` or `~/.omp/profiles/<profile>/agent`) **is**
 ## Features
 
 - 🔒 **Encrypted Credentials Vault:** Optional password-protected AES-256-GCM encrypted vault (`vault.enc`) to synchronize session tokens and logins (`auth.json`, `auth-broker.json`) safely across devices.
-- ⚡ **Instant Startup Sync & Progress Bar:** Automatically syncs immediately upon opening/starting Oh My Pi with a visual progress bar indicator (`🔄 Sync [█████░░░░░] 50% Fetching...`).
-- ⏱️ **1-Minute Background Sync:** Periodically checks every 60 seconds and syncs automatically whenever local or remote changes are detected.
 - 💻 **Cross-Platform Compatibility:** Full native support for Windows, macOS, and Linux with robust path normalization, CRLF/LF line-ending preservation, and safe process locking.
 - 🛡️ **4-Tier Security Guards:** Inverted allowlist `.gitignore`, local `.git/info/exclude`, pre-commit staging blocker, and tracked file scanner ensuring plaintext secrets, tokens, and SQLite databases (`agent.db*`, `models.db*`, `history.db*`) are never committed.
 - ⚙️ **Dual YAML & JSON Clean/Smudge Filter:** Machine-local settings (`images.urls.credentials`, `dev.autoqaPush.token`, `searxng.*`, `hindsight.*`, `auth.broker.*`, `setupVersion`, `shellPath`, etc.) are stripped from commits and preserved in local sidecars.
@@ -69,11 +67,8 @@ On your second device, run:
 - **If you skip or leave the passphrase blank:** All unencrypted configuration syncs normally with zero errors. You can unlock your credentials vault anytime later.
 - Any differing local allowed files are safely preserved as `<file>.local-backup`.
 
-### 3. Daily Synchronization
-Synchronization is fully automated:
-- **On Opening (Startup):** Automatically syncs and pulls remote updates on session start with progress bar feedback.
-- **Background Checks:** Runs every 60 seconds and synchronizes whenever local or remote changes are detected.
-- **Session Shutdown:** Performs a fast best-effort commit and push.
+### 3. Manual Synchronization
+Nothing synchronizes automatically. Run `/ompsync sync` (commit, pull, push), `/ompsync push`, or `/ompsync pull` when you want to sync. Session start and shutdown do not commit or push.
 
 ---
 
@@ -131,7 +126,6 @@ Create `~/.omp/agent/omp-sync.jsonc` (or `git-sync.jsonc`):
 
 ```jsonc
 {
-  "autoSyncIntervalMinutes": 1,
   "includeHostname": true,
   "extraPaths": ["custom-safe-dir"],
   "warnOnPublicRemote": true,
