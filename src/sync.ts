@@ -23,6 +23,7 @@ import {
   pushOrigin,
   upstreamRef,
 } from "./git.js";
+import { memorySnapshotHashes, restoreMemorySnapshots, writeMemorySnapshots } from "./memory.js";
 import { isSubagentChild, shouldCheckRemote, withLock, writeSyncState } from "./lock.js";
 
 import {
@@ -101,6 +102,19 @@ export async function prepareCommit(deps?: Deps, ctx?: Ctx) {
   await ensureAttributes(dir);
   await ensureFilter(dir, config);
   await refreshMachineSidecar(dir, config);
+
+  // Migration: earlier manual setups committed the live WAL databases. They are hard-denied and
+  // replaced by mnemopi.snap, so drop them from the index (the files on disk are kept).
+  const legacyDbs = (await git(["ls-files", "-z", "--", "memories/mnemopi"], dir)).stdout
+    .split("\0")
+    .filter((f) => f.endsWith("/mnemopi.db"));
+  if (legacyDbs.length) {
+    await git(["rm", "--cached", "-q", "--", ...legacyDbs], dir);
+  }
+  const memory = await writeMemorySnapshots(dir);
+  for (const err of memory.errors) {
+    notify(ctx, `omp-sync: could not snapshot memory db: ${err}`, "warning", deps);
+  }
 
   // If vault is enabled and unlocked on this machine, update vault.enc ONLY IF sensitive files changed
   const vaultStatus = await getVaultStatus(dir);
@@ -369,6 +383,10 @@ export async function runLink(
   }
 
   await git(["branch", "-u", `origin/${branch}`, branch], dir).catch(() => {});
+  const restoredMemory = await restoreMemorySnapshots(dir);
+  if (restoredMemory.length) {
+    notify(ctx, `omp-sync: restored memory databases: ${restoredMemory.join(", ")}. Restart omp to load them.`, "info", deps);
+  }
 
 
   // Handle encrypted vault if present
@@ -543,6 +561,7 @@ export async function runReset(ctx: Ctx, deps?: Deps): Promise<void> {
   await ensureAttributes(dir);
   await ensureFilter(dir, config);
   await refreshMachineSidecar(dir, config);
+  await restoreMemorySnapshots(dir);
 
   let vaultRestored = false;
   const vaultStatus = await getVaultStatus(dir);
@@ -627,6 +646,7 @@ export async function runSync(
       if (upstream) {
         const { behind } = await countAheadBehind(upstream, dir).catch(() => ({ behind: 0, ahead: 0 }));
         if (behind > 0) {
+          const memoryBefore = await memorySnapshotHashes(dir);
           updateSyncProgress(ctx, 70, "Integrating remote changes...");
           if (!(await integrateUpstream(upstream, dir))) {
             if (config.discardLocalOnConflict) {
@@ -636,6 +656,11 @@ export async function runSync(
             throw new Error(`local and remote diverged with conflicts; rebase aborted in ${dir}. Run '/ompsync reset' to discard local changes and sync from remote.`);
           }
           changed.push("pulled updates");
+          const restoredMemory = await restoreMemorySnapshots(
+            dir,
+            [...(await memorySnapshotHashes(dir))].filter(([rel, hash]) => memoryBefore.get(rel) !== hash).map(([rel]) => rel),
+          );
+          if (restoredMemory.length) changed.push(`restored memory (${restoredMemory.length} db, restart omp to load)`);
 
           // If remote updated vault.enc and we have a cached password, update local credentials
           const vaultStatus = await getVaultStatus(dir);

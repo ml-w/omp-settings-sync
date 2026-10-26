@@ -139,12 +139,14 @@ export async function pushOrigin(first = false, dir: string): Promise<boolean> {
 }
 
 
+import { memoryHasChanges } from "./memory.js";
 import { getVaultStatus, hasSensitiveChanges } from "./vault.js";
 
 export async function hasLocalChanges(dir = dirOf()): Promise<boolean> {
   try {
     const { stdout } = await git(["status", "--porcelain"], dir);
     if (stdout.trim().length > 0) return true;
+    if (await memoryHasChanges(dir)) return true;
     const vaultStatus = await getVaultStatus(dir);
     if (vaultStatus === "unlocked") {
       return await hasSensitiveChanges(dir);

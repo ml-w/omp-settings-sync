@@ -33,6 +33,7 @@ export const DEFAULT_ALLOWED_PATHS = [
   "prompts",
   "themes",
   "plugins",
+  "memories/mnemopi",
 ];
 
 export const HARD_DENY_PATTERNS = [
@@ -185,7 +186,8 @@ export async function ensureInfoExclude(dir: string): Promise<void> {
 }
 
 export async function stagedSecretFiles(dir: string): Promise<string[]> {
-  const { stdout } = await git(["diff", "--cached", "--name-only", "-z"], dir);
+  // --diff-filter=d: removing a sensitive file from the index is the fix, not a leak.
+  const { stdout } = await git(["diff", "--cached", "--name-only", "--diff-filter=d", "-z"], dir);
   return stdout.split("\0").filter(Boolean).filter(isDenied);
 }
 
