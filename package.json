@@ -28,12 +28,12 @@
   ],
   "omp": {
     "extensions": [
-      "./dist/index.js"
+      "./src/index.ts"
     ]
   },
   "pi": {
     "extensions": [
-      "./dist/index.js"
+      "./src/index.ts"
     ]
   },
   "peerDependencies": {
