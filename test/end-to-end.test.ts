@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { git } from "../src/git.js";
+import { writeSyncState } from "../src/lock.js";
 import { checkAndBackgroundSync, runInit, runLink, runSync, runUnlockVault, showStatus } from "../src/sync.js";
 
 import { getVaultStatus } from "../src/vault.js";
@@ -62,6 +63,23 @@ test("checkAndBackgroundSync detects local changes and syncs them automatically"
     (await fs.readFile(path.join(b.dir, "AGENTS.md"), "utf8")).replace(/\r\n/g, "\n"),
     "# Background synced changes\n"
   );
+});
+
+test("checkAndBackgroundSync waits out autoSyncIntervalMinutes even when local files changed", async () => {
+  const a = await createMachineFixture("bg-stale-a");
+  const remote = await createBareRemote(a.root);
+  const ghA = createFakeGh();
+  await runInit(remote, undefined, { dir: a.dir, gh: ghA });
+
+  await fs.writeFile(
+    path.join(a.dir, "omp-sync.jsonc"),
+    JSON.stringify({ autoSyncIntervalMinutes: 1440 })
+  );
+  await writeSyncState({ lastAutoSyncAt: new Date().toISOString() }, a.dir);
+  await fs.writeFile(path.join(a.dir, "AGENTS.md"), "# Not yet\n");
+
+  const synced = await checkAndBackgroundSync(undefined, { dir: a.dir });
+  assert.equal(synced, false);
 });
 
 test("encrypted vault lifecycle: init with password, link with password restores auth.json, link without password gracefully falls back and unlocks later", async () => {

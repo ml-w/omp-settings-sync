@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import { dirOf } from "./config.js";
+import { dirOf, readConfig, resolveSyncSchedule } from "./config.js";
 import { countAheadBehind, isSyncableRepo, pushOrigin, upstreamRef } from "./git.js";
-import { isSubagentChild, withLock, writeSyncState } from "./lock.js";
+import { isSubagentChild, shouldAutoSync, withLock, writeSyncState } from "./lock.js";
 import {
   checkAndBackgroundSync,
   commitLocalChanges,
@@ -16,8 +16,6 @@ import {
   runUnlockVault,
   showStatus,
 } from "./sync.js";
-
-const BACKGROUND_SYNC_INTERVAL_MS = 60_000; // 1 minute
 
 export default function gitSyncExtension(pi: ExtensionAPI) {
   pi.setLabel("OMP Config Git Sync");
@@ -109,20 +107,25 @@ export default function gitSyncExtension(pi: ExtensionAPI) {
 
 
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
-    // 1. Sync immediately on opening / startup
+    const schedule = resolveSyncSchedule(await readConfig());
+
     if (!isSubagentChild() && (await isSyncableRepo())) {
-      try {
-        await withLock(ctx, async () => {
-          await writeSyncState({ lastAutoSyncAt: new Date().toISOString() });
-          await runSync(ctx, { auto: true, push: true });
-        });
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        if (ctx.hasUI && ctx.ui) ctx.ui.notify(`omp-sync skipped: ${msg}`, "warning");
+      const due = schedule.syncMode === "always" || (await shouldAutoSync());
+      if (due) {
+        try {
+          await withLock(ctx, async () => {
+            await writeSyncState({ lastAutoSyncAt: new Date().toISOString() });
+            await runSync(ctx, { auto: true, push: true });
+          });
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          if (ctx.hasUI && ctx.ui) ctx.ui.notify(`omp-sync skipped: ${msg}`, "warning");
+        }
       }
     }
 
-    // 2. Schedule 1-minute background sync interval to sync whenever changes occur
+    if (schedule.backgroundSyncIntervalMinutes <= 0) return;
+
     const scheduleInterval =
       typeof ctx.setInterval === "function"
         ? (fn: () => void, ms: number) => ctx.setInterval(fn, ms)
@@ -136,7 +139,7 @@ export default function gitSyncExtension(pi: ExtensionAPI) {
       try {
         await checkAndBackgroundSync(ctx);
       } catch {}
-    }, BACKGROUND_SYNC_INTERVAL_MS);
+    }, schedule.backgroundSyncIntervalMinutes * 60_000);
   });
 
   pi.on("session_shutdown", async (event, ctx: ExtensionContext) => {
@@ -145,6 +148,7 @@ export default function gitSyncExtension(pi: ExtensionAPI) {
         ? event.reason
         : undefined;
     if (reason === "reload" || isSubagentChild() || !(await isSyncableRepo())) return;
+    if (!resolveSyncSchedule(await readConfig()).syncOnSessionShutdown) return;
 
     try {
       await withLock(ctx, async () => {
@@ -160,6 +164,7 @@ export default function gitSyncExtension(pi: ExtensionAPI) {
             await pushOrigin(false, dir);
           }
         }
+        await writeSyncState({ lastAutoSyncAt: new Date().toISOString() }, dir);
       });
     } catch {}
   });

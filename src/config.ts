@@ -4,8 +4,14 @@ import path from "node:path";
 import type { GhClient } from "./gh.js";
 import { isDenied } from "./security.js";
 
+export type SyncMode = "always" | "startIfStale";
+
 export interface OmpSyncConfig {
+  syncMode?: SyncMode;
   autoSyncIntervalMinutes?: number;
+  backgroundSyncIntervalMinutes?: number;
+  remoteCheckIntervalMinutes?: number;
+  syncOnSessionShutdown?: boolean;
   includeHostname?: boolean;
   extraPaths?: string[];
   warnOnPublicRemote?: boolean;
@@ -13,6 +19,65 @@ export interface OmpSyncConfig {
   machineLocalYamlKeys?: string[];
   preferRemote?: boolean;
   discardLocalOnConflict?: boolean;
+}
+
+export interface SyncSchedule {
+  syncMode: SyncMode;
+  syncOnSessionShutdown: boolean;
+  autoSyncIntervalMinutes: number;
+  backgroundSyncIntervalMinutes: number;
+  remoteCheckIntervalMinutes: number;
+}
+
+export const DEFAULT_START_IF_STALE_MINUTES = 10;
+export const DEFAULT_ALWAYS_SYNC_INTERVAL_MINUTES = 1;
+export const DEFAULT_BACKGROUND_SYNC_INTERVAL_MINUTES = 1;
+export const DEFAULT_REMOTE_CHECK_INTERVAL_MINUTES = 5;
+
+function finiteMinutes(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value;
+}
+
+export function resolveSyncSchedule(config: OmpSyncConfig): SyncSchedule {
+  const explicit = config.syncMode;
+  const configuredInterval = finiteMinutes(config.autoSyncIntervalMinutes);
+  let syncMode: SyncMode;
+  if (explicit === "always" || explicit === "startIfStale") {
+    syncMode = explicit;
+  } else if (explicit !== undefined) {
+    syncMode = "always";
+  } else if (configuredInterval !== undefined && configuredInterval > 0) {
+    syncMode = "startIfStale";
+  } else {
+    syncMode = "always";
+  }
+
+  const intervalFallback = syncMode === "startIfStale" ? DEFAULT_START_IF_STALE_MINUTES : DEFAULT_ALWAYS_SYNC_INTERVAL_MINUTES;
+  const autoSyncIntervalMinutes =
+    configuredInterval !== undefined && configuredInterval > 0 ? configuredInterval : intervalFallback;
+
+  const configuredBackground = finiteMinutes(config.backgroundSyncIntervalMinutes);
+  const backgroundSyncIntervalMinutes =
+    configuredBackground !== undefined && configuredBackground >= 0
+      ? configuredBackground
+      : DEFAULT_BACKGROUND_SYNC_INTERVAL_MINUTES;
+
+  const configuredRemote = finiteMinutes(config.remoteCheckIntervalMinutes);
+  const remoteCheckIntervalMinutes =
+    configuredRemote !== undefined && configuredRemote > 0
+      ? configuredRemote
+      : configuredInterval !== undefined && configuredInterval > 0
+        ? configuredInterval
+        : DEFAULT_REMOTE_CHECK_INTERVAL_MINUTES;
+
+  return {
+    syncMode,
+    syncOnSessionShutdown: config.syncOnSessionShutdown !== false,
+    autoSyncIntervalMinutes,
+    backgroundSyncIntervalMinutes,
+    remoteCheckIntervalMinutes,
+  };
 }
 
 

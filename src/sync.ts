@@ -24,7 +24,7 @@ import {
   upstreamRef,
 } from "./git.js";
 import { memorySnapshotHashes, restoreMemorySnapshots, writeMemorySnapshots } from "./memory.js";
-import { isSubagentChild, shouldCheckRemote, withLock, writeSyncState } from "./lock.js";
+import { isSubagentChild, shouldAutoSync, shouldCheckRemote, withLock, writeSyncState } from "./lock.js";
 
 import {
   ensureIgnoreRules,
@@ -717,9 +717,10 @@ export async function checkAndBackgroundSync(ctx: Ctx, deps?: Deps): Promise<boo
   const dir = dirOf(deps);
   if (isSubagentChild() || !(await isSyncableRepo(dir))) return false;
 
+  if (!(await shouldAutoSync(deps))) return false;
+
   const localChanges = await hasLocalChanges(dir);
-  const config = await readConfig(deps, ctx);
-  const checkRemote = localChanges || (await shouldCheckRemote(deps, config.autoSyncIntervalMinutes ?? 5));
+  const checkRemote = localChanges || (await shouldCheckRemote(deps));
 
   if (!localChanges && !checkRemote) return false;
 

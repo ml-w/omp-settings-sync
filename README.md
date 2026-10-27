@@ -13,8 +13,8 @@ The agent directory (`~/.omp/agent` or `~/.omp/profiles/<profile>/agent`) **is**
 ## Features
 
 - 🔒 **Encrypted Credentials Vault:** Optional password-protected AES-256-GCM encrypted vault (`vault.enc`) to synchronize session tokens and logins (`auth.json`, `auth-broker.json`) safely across devices.
-- ⚡ **Instant Startup Sync & Progress Bar:** Automatically syncs immediately upon opening/starting Oh My Pi with a visual progress bar indicator (`🔄 Sync [█████░░░░░] 50% Fetching...`).
-- ⏱️ **1-Minute Background Sync:** Periodically checks every 60 seconds and syncs automatically whenever local or remote changes are detected.
+- ⚡ **Startup Sync & Progress Bar:** Syncs when a session starts, with a visual progress bar (`🔄 Sync [█████░░░░░] 50% Fetching...`). Set `autoSyncIntervalMinutes` or `syncMode: "startIfStale"` to skip startup when the last automatic sync is still fresh.
+- ⏱️ **Background Sync:** Checks on an interval (default 60 seconds) and synchronizes when local or remote changes are detected and the auto-sync interval has elapsed.
 - 💻 **Cross-Platform Compatibility:** Full native support for Windows, macOS, and Linux with robust path normalization, CRLF/LF line-ending preservation, and safe process locking.
 - 🛡️ **4-Tier Security Guards:** Inverted allowlist `.gitignore`, local `.git/info/exclude`, pre-commit staging blocker, and tracked file scanner ensuring plaintext secrets, tokens, and SQLite databases (`agent.db*`, `models.db*`, `history.db*`) are never committed.
 - ⚙️ **Dual YAML & JSON Clean/Smudge Filter:** Machine-local settings (`images.urls.credentials`, `dev.autoqaPush.token`, `searxng.*`, `hindsight.*`, `auth.broker.*`, `setupVersion`, `shellPath`, etc.) are stripped from commits and preserved in local sidecars.
@@ -71,9 +71,9 @@ On your second device, run:
 
 ### 3. Daily Synchronization
 Synchronization is fully automated:
-- **On Opening (Startup):** Automatically syncs and pulls remote updates on session start with progress bar feedback.
-- **Background Checks:** Runs every 60 seconds and synchronizes whenever local or remote changes are detected.
-- **Session Shutdown:** Performs a fast best-effort commit and push.
+- **On Opening (Startup):** Syncs on session start. With `syncMode: "startIfStale"`, or whenever `autoSyncIntervalMinutes` is set, startup is skipped until that many minutes have passed since the last automatic sync. `startIfStale` defaults to 10 minutes.
+- **Background Checks:** Wakes every `backgroundSyncIntervalMinutes` (default 1). A full sync still waits for `autoSyncIntervalMinutes`. Set the background interval to `0` to disable the timer.
+- **Session Shutdown:** Performs a fast best-effort commit and push. Set `syncOnSessionShutdown` to `false` to skip it. A shutdown sync records the time used by the stale-startup check.
 
 ---
 
@@ -131,7 +131,11 @@ Create `~/.omp/agent/omp-sync.jsonc` (or `git-sync.jsonc`):
 
 ```jsonc
 {
-  "autoSyncIntervalMinutes": 1,
+  "syncMode": "startIfStale",
+  "autoSyncIntervalMinutes": 10,
+  "backgroundSyncIntervalMinutes": 1,
+  "remoteCheckIntervalMinutes": 5,
+  "syncOnSessionShutdown": true,
   "includeHostname": true,
   "extraPaths": ["custom-safe-dir"],
   "warnOnPublicRemote": true,

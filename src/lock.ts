@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Ctx, Deps } from "./config.js";
-import { dirOf, readConfig } from "./config.js";
+import { dirOf, readConfig, resolveSyncSchedule } from "./config.js";
 import { isSyncableRepo } from "./git.js";
 
 export const DEFAULT_AUTO_SYNC_INTERVAL_MINUTES = 1;
@@ -73,16 +73,18 @@ export async function shouldAutoSync(deps?: Deps): Promise<boolean> {
   const state = await readSyncState(dir);
   if (!state.lastAutoSyncAt) return true;
 
-  const config = await readConfig(deps);
-  const intervalMs = (config.autoSyncIntervalMinutes ?? DEFAULT_AUTO_SYNC_INTERVAL_MINUTES) * 60_000;
+  const schedule = resolveSyncSchedule(await readConfig(deps));
+  const intervalMs = schedule.autoSyncIntervalMinutes * 60_000;
   return Date.now() - Date.parse(state.lastAutoSyncAt) >= intervalMs;
 }
 
-export async function shouldCheckRemote(deps?: Deps, minIntervalMinutes = DEFAULT_REMOTE_CHECK_INTERVAL_MINUTES): Promise<boolean> {
+export async function shouldCheckRemote(deps?: Deps, minIntervalMinutes?: number): Promise<boolean> {
   const dir = dirOf(deps);
   const state = await readSyncState(dir);
   if (!state.lastRemoteCheckAt) return true;
-  const intervalMs = minIntervalMinutes * 60_000;
+  const minutes =
+    minIntervalMinutes ?? resolveSyncSchedule(await readConfig(deps)).remoteCheckIntervalMinutes;
+  const intervalMs = minutes * 60_000;
   return Date.now() - Date.parse(state.lastRemoteCheckAt) >= intervalMs;
 }
 

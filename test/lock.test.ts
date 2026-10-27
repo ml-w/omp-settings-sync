@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { isSubagentChild, withLock } from "../src/lock.js";
+import { git } from "../src/git.js";
+import { isSubagentChild, shouldAutoSync, withLock, writeSyncState } from "../src/lock.js";
 
 test("isSubagentChild detects subagent environment variables", () => {
   delete process.env.PI_SUBAGENT_DEPTH;
@@ -60,5 +61,19 @@ test("withLock serializes concurrent in-process calls without self-deadlock", as
   assert.equal(res1, "res1");
   assert.equal(res2, "res2");
   assert.deepEqual(order, [1, 2]);
+});
+
+test("shouldAutoSync skips a recent sync and allows one older than the stale interval", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-stale-sync-"));
+  await git(["init", "-b", "main"], root);
+  await git(["remote", "add", "origin", "https://example.invalid/repo.git"], root);
+  await fs.writeFile(path.join(root, "omp-sync.jsonc"), JSON.stringify({ syncMode: "startIfStale" }));
+  const deps = { dir: root };
+
+  await writeSyncState({ lastAutoSyncAt: new Date(Date.now() - 9 * 60_000).toISOString() }, root);
+  assert.equal(await shouldAutoSync(deps), false);
+
+  await writeSyncState({ lastAutoSyncAt: new Date(Date.now() - 10 * 60_000 - 1_000).toISOString() }, root);
+  assert.equal(await shouldAutoSync(deps), true);
 });
 
