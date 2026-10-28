@@ -4,7 +4,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { ensureFilter, refreshMachineSidecar } from "../src/filter.js";
+import {
+  ensureAttributes,
+  ensureFilter,
+  isNodeInterpreter,
+  refreshMachineSidecar,
+  resolveFilterInterpreter,
+} from "../src/filter.js";
 import { sh } from "./helpers.js";
 
 test("filter cleans machine keys and smudges them back for YAML config", async () => {
@@ -43,4 +49,66 @@ test("filter cleans machine keys and smudges them back for YAML config", async (
   assert.match(smudgeResult, /setupVersion/);
   assert.match(smudgeResult, /shellPath/);
   assert.match(smudgeResult, /titanium/);
+});
+
+test("resolveFilterInterpreter uses node, never a packaged host binary", () => {
+  assert.equal(isNodeInterpreter("C:/Users/lwong/AppData/Local/omp/omp.exe"), false);
+  assert.equal(isNodeInterpreter("C:/Program Files/nodejs/node.exe"), true);
+  assert.equal(isNodeInterpreter("/usr/bin/node"), true);
+
+  const fromNode = resolveFilterInterpreter(process.execPath);
+  assert.equal(isNodeInterpreter(fromNode), true);
+
+  const fromHost = resolveFilterInterpreter("C:/Users/lwong/AppData/Local/omp/omp.exe");
+  assert.equal(isNodeInterpreter(fromHost), true);
+  assert.doesNotMatch(fromHost, /omp\.exe$/i);
+
+  assert.throws(
+    () => resolveFilterInterpreter("C:/Users/lwong/AppData/Local/omp/omp.exe", { PATH: "", Path: "" }),
+    /Node\.js executable/
+  );
+});
+
+test("ensureAttributes removes local -filter overrides that would skip the driver", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-filter-attrs-"));
+  await sh("git", ["init", "-b", "main"], root);
+  await fs.mkdir(path.join(root, ".git", "info"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, ".git", "info", "attributes"),
+    "config.yml -filter\nsettings.json -filter\ncustom.bin -text\n"
+  );
+
+  await ensureAttributes(root);
+
+  const info = await fs.readFile(path.join(root, ".git", "info", "attributes"), "utf8");
+  assert.doesNotMatch(info, /-filter/);
+  assert.match(info, /custom\.bin -text/);
+  const bound = (await sh("git", ["check-attr", "filter", "--", "config.yml"], root)).stdout;
+  assert.match(bound, /omp-config-sync-yaml/);
+});
+
+test("ensureFilter registers a node interpreter and git add runs the clean filter", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-filter-git-"));
+  await sh("git", ["init", "-b", "main"], root);
+  await sh("git", ["config", "user.email", "tests@omp-settings-sync.invalid"], root);
+  await sh("git", ["config", "user.name", "omp-settings-sync tests"], root);
+
+  const initialConfig = `theme:\n  dark: titanium\nsetupVersion: 2\nshellPath: /bin/zsh\n`;
+  await fs.writeFile(path.join(root, "config.yml"), initialConfig);
+
+  await ensureAttributes(root);
+  await ensureFilter(root, { machineLocalYamlKeys: ["setupVersion", "shellPath"] });
+
+  const cleanCmd = (await sh("git", ["config", "--get", "filter.omp-config-sync-yaml.clean"], root)).stdout.trim();
+  const smudgeCmd = (await sh("git", ["config", "--get", "filter.omp-config-sync-yaml.smudge"], root)).stdout.trim();
+  assert.match(cleanCmd, /node(\.exe)?/i);
+  assert.doesNotMatch(cleanCmd, /omp\.exe/i);
+  assert.match(smudgeCmd, /node(\.exe)?/i);
+  assert.doesNotMatch(smudgeCmd, /omp\.exe/i);
+
+  await sh("git", ["add", "config.yml"], root);
+  const staged = (await sh("git", ["show", ":config.yml"], root)).stdout;
+  assert.doesNotMatch(staged, /setupVersion/);
+  assert.doesNotMatch(staged, /shellPath/);
+  assert.match(staged, /titanium/);
 });

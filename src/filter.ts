@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { OmpSyncConfig } from "./config.js";
@@ -130,6 +131,28 @@ export async function ensureAttributes(dir: string): Promise<void> {
     const next = (current.trim() ? `${current.trim()}\n` : "") + missing.join("\n") + "\n";
     await fs.writeFile(file, next);
   }
+
+  // $GIT_DIR/info/attributes wins over .gitattributes. A previous workaround
+  // unset these filters; leave that in place and git never runs the driver.
+  const infoAttributes = path.join(dir, ".git", "info", "attributes");
+  try {
+    const info = await fs.readFile(infoAttributes, "utf8");
+    const disable = new Set([
+      "config.yml -filter",
+      "config.yaml -filter",
+      "settings.json -filter",
+      "mcp.json -filter",
+    ]);
+    const lines = info.split(/\r?\n/).filter((line, i, arr) => !(i === arr.length - 1 && line === ""));
+    const kept = lines.filter((line) => !disable.has(line.trim()));
+    if (kept.length !== lines.length) {
+      if (kept.length === 0) {
+        await fs.rm(infoAttributes, { force: true });
+      } else {
+        await fs.writeFile(infoAttributes, kept.join("\n") + "\n");
+      }
+    }
+  } catch {}
 }
 
 async function gitConfigValue(key: string, dir: string): Promise<string | undefined> {
@@ -140,8 +163,44 @@ async function gitConfigValue(key: string, dir: string): Promise<string | undefi
   }
 }
 
-function formatFilterCommand(scriptPath: string, mode: string, format: string): string {
-  const nodeExec = process.execPath.replaceAll("\\", "/");
+export function isNodeInterpreter(execPath: string): boolean {
+  const name = path.basename(execPath).toLowerCase();
+  return name === "node" || name === "node.exe";
+}
+
+function pathDirs(env: NodeJS.ProcessEnv): string[] {
+  const key = Object.keys(env).find((k) => k.toLowerCase() === "path");
+  if (!key || !env[key]) return [];
+  return env[key].split(path.delimiter).filter(Boolean);
+}
+
+/** Git filters must spawn Node, not a packaged host like omp.exe (that re-enters this extension). */
+export function resolveFilterInterpreter(
+  execPath = process.execPath,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  if (isNodeInterpreter(execPath)) {
+    return execPath.replaceAll("\\", "/");
+  }
+
+  const names = process.platform === "win32" ? ["node.exe", "node"] : ["node"];
+  for (const dir of pathDirs(env)) {
+    if (/WindowsApps/i.test(dir)) continue;
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (existsSync(candidate) && isNodeInterpreter(candidate)) {
+        return candidate.replaceAll("\\", "/");
+      }
+    }
+  }
+
+  throw new Error(
+    "omp-sync git filter requires a Node.js executable. The host binary is not node, and node was not found on PATH."
+  );
+}
+
+function formatFilterCommand(interpreter: string, scriptPath: string, mode: string, format: string): string {
+  const nodeExec = interpreter.replaceAll("\\", "/");
   const script = scriptPath.replaceAll("\\", "/");
   return `"${nodeExec}" "${script}" ${mode} ${format}`;
 }
@@ -161,12 +220,13 @@ export async function ensureFilter(dir: string, config: OmpSyncConfig = {}): Pro
     await fs.writeFile(scriptPath, source);
   }
 
+  const interpreter = resolveFilterInterpreter();
   const configs: Record<string, string> = {
-    "filter.omp-config-sync-yaml.clean": formatFilterCommand(scriptPath, "clean", "yaml"),
-    "filter.omp-config-sync-yaml.smudge": formatFilterCommand(scriptPath, "smudge", "yaml"),
+    "filter.omp-config-sync-yaml.clean": formatFilterCommand(interpreter, scriptPath, "clean", "yaml"),
+    "filter.omp-config-sync-yaml.smudge": formatFilterCommand(interpreter, scriptPath, "smudge", "yaml"),
     "filter.omp-config-sync-yaml.required": "false",
-    "filter.omp-config-sync-json.clean": formatFilterCommand(scriptPath, "clean", "json"),
-    "filter.omp-config-sync-json.smudge": formatFilterCommand(scriptPath, "smudge", "json"),
+    "filter.omp-config-sync-json.clean": formatFilterCommand(interpreter, scriptPath, "clean", "json"),
+    "filter.omp-config-sync-json.smudge": formatFilterCommand(interpreter, scriptPath, "smudge", "json"),
     "filter.omp-config-sync-json.required": "false",
   };
 

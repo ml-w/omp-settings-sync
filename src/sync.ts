@@ -550,6 +550,10 @@ export async function runReset(ctx: Ctx, deps?: Deps): Promise<void> {
   const branch = await defaultBranch(dir);
   updateSyncProgress(ctx, 50, `Resetting to origin/${branch}...`);
 
+  // Smudge runs during reset --hard. Install a Node interpreter first so a
+  // leftover omp.exe filter cannot spawn another agent session.
+  await ensureFilter(dir, await readConfig(deps, ctx));
+
   // Discard all local changes, commits, and conflicts; force reset to remote branch
   await git(["reset", "--hard", `origin/${branch}`], dir);
   await git(["clean", "-fd"], dir).catch(() => {});
