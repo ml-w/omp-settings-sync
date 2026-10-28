@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Ctx, Deps } from "./config.js";
 import { dirOf, readConfig } from "./config.js";
-import { ensureAttributes, ensureFilter, refreshMachineSidecar } from "./filter.js";
+import { applyMachineSidecar, ensureAttributes, ensureFilter, refreshMachineSidecar } from "./filter.js";
 import { DEFAULT_SYNC_REPO_NAME, defaultGh, LIKELY_SYNC_REPO_NAMES, parseRepoReference, remoteFromArg } from "./gh.js";
 import {
   countAheadBehind,
@@ -383,6 +383,7 @@ export async function runLink(
   }
 
   await git(["branch", "-u", `origin/${branch}`, branch], dir).catch(() => {});
+  await applyMachineSidecar(dir);
   const restoredMemory = await restoreMemorySnapshots(dir);
   if (restoredMemory.length) {
     notify(ctx, `omp-sync: restored memory databases: ${restoredMemory.join(", ")}. Restart omp to load them.`, "info", deps);
@@ -550,16 +551,23 @@ export async function runReset(ctx: Ctx, deps?: Deps): Promise<void> {
   const branch = await defaultBranch(dir);
   updateSyncProgress(ctx, 50, `Resetting to origin/${branch}...`);
 
+  // Smudge runs during reset --hard. Install a Node interpreter and drop any
+  // info/attributes `-filter` override first, so a leftover omp filter cannot
+  // skip setupVersion and force onboarding again.
+  const config = await readConfig(deps, ctx);
+  await ensureAttributes(dir);
+  await ensureFilter(dir, config);
+
   // Discard all local changes, commits, and conflicts; force reset to remote branch
   await git(["reset", "--hard", `origin/${branch}`], dir);
   await git(["clean", "-fd"], dir).catch(() => {});
 
   updateSyncProgress(ctx, 80, "Restoring configuration & vault...");
-  const config = await readConfig(deps, ctx);
   await ensureIgnoreRules(dir, config);
   await ensureInfoExclude(dir);
   await ensureAttributes(dir);
   await ensureFilter(dir, config);
+  await applyMachineSidecar(dir);
   await refreshMachineSidecar(dir, config);
   await restoreMemorySnapshots(dir);
 
@@ -655,6 +663,7 @@ export async function runSync(
             }
             throw new Error(`local and remote diverged with conflicts; rebase aborted in ${dir}. Run '/ompsync reset' to discard local changes and sync from remote.`);
           }
+          await applyMachineSidecar(dir);
           changed.push("pulled updates");
           const restoredMemory = await restoreMemorySnapshots(
             dir,
@@ -690,6 +699,7 @@ export async function runSync(
           updateSyncProgress(ctx, 92, "Remote advanced, reconciling changes...");
           if (await fetchOrigin(dir)) {
             if (await integrateUpstream(upstream, dir)) {
+              await applyMachineSidecar(dir);
               pushed = await pushOrigin(false, dir);
             }
           }

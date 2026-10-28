@@ -1,4 +1,4 @@
-import { accessSync, constants as fsConstants } from "node:fs";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { OmpSyncConfig } from "./config.js";
@@ -131,6 +131,28 @@ export async function ensureAttributes(dir: string): Promise<void> {
     const next = (current.trim() ? `${current.trim()}\n` : "") + missing.join("\n") + "\n";
     await fs.writeFile(file, next);
   }
+
+  // $GIT_DIR/info/attributes wins over .gitattributes. A previous workaround
+  // unset these filters; leave that in place and git never runs the driver.
+  const infoAttributes = path.join(dir, ".git", "info", "attributes");
+  const disabledFilter: Record<string, true> = {
+    "config.yml -filter": true,
+    "config.yaml -filter": true,
+    "settings.json -filter": true,
+    "mcp.json -filter": true,
+  };
+  try {
+    const info = await fs.readFile(infoAttributes, "utf8");
+    const lines = info.split(/\r?\n/).filter((line, i, arr) => !(i === arr.length - 1 && line === ""));
+    const kept = lines.filter((line) => !disabledFilter[line.trim()]);
+    if (kept.length !== lines.length) {
+      if (kept.length === 0) {
+        await fs.rm(infoAttributes, { force: true });
+      } else {
+        await fs.writeFile(infoAttributes, kept.join("\n") + "\n");
+      }
+    }
+  } catch {}
 }
 
 async function gitConfigValue(key: string, dir: string): Promise<string | undefined> {
@@ -141,40 +163,44 @@ async function gitConfigValue(key: string, dir: string): Promise<string | undefi
   }
 }
 
-/**
- * Pick the JavaScript runtime that git should use to run the clean/smudge filter script.
- *
- * `process.execPath` is only a JS runtime when the extension is loaded by plain node or bun. When it is
- * loaded inside a compiled omp, `process.execPath` is the omp binary itself, and git would start a full
- * omp agent for every filtered file. In that case, look up `node`, then `bun`, on PATH instead.
- */
-export function resolveJsRuntime(
-  execPath: string = process.execPath,
-  pathEnv: string = process.env.PATH ?? "",
-  platform: NodeJS.Platform = process.platform
-): string {
-  const pathLib = platform === "win32" ? path.win32 : path;
-  const base = pathLib.basename(execPath).toLowerCase().replace(/\.exe$/, "");
-  if (base === "node" || base === "bun") return execPath;
+export function isNodeInterpreter(execPath: string): boolean {
+  const name = path.basename(execPath).toLowerCase();
+  return name === "node" || name === "node.exe";
+}
 
-  const exts = platform === "win32" ? [".exe", ".cmd", ""] : [""];
-  for (const name of ["node", "bun"]) {
-    for (const dir of pathEnv.split(pathLib.delimiter)) {
-      if (!dir) continue;
-      for (const ext of exts) {
-        const candidate = pathLib.join(dir, name + ext);
-        try {
-          accessSync(candidate, fsConstants.X_OK);
-          return candidate;
-        } catch {}
+function pathDirs(env: NodeJS.ProcessEnv): string[] {
+  const key = Object.keys(env).find((k) => k.toLowerCase() === "path");
+  if (!key || !env[key]) return [];
+  return env[key].split(path.delimiter).filter(Boolean);
+}
+
+/** Git filters must spawn Node, not a packaged host like omp.exe (that re-enters this extension). */
+export function resolveFilterInterpreter(
+  execPath = process.execPath,
+  env: NodeJS.ProcessEnv = process.env
+): string {
+  if (isNodeInterpreter(execPath)) {
+    return execPath.replaceAll("\\", "/");
+  }
+
+  const names = process.platform === "win32" ? ["node.exe", "node"] : ["node"];
+  for (const dir of pathDirs(env)) {
+    if (/WindowsApps/i.test(dir)) continue;
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (existsSync(candidate) && isNodeInterpreter(candidate)) {
+        return candidate.replaceAll("\\", "/");
       }
     }
   }
-  return "node";
+
+  throw new Error(
+    "omp-sync git filter requires a Node.js executable. The host binary is not node, and node was not found on PATH."
+  );
 }
 
-export function formatFilterCommand(scriptPath: string, mode: string, format: string, runtime = resolveJsRuntime()): string {
-  const nodeExec = runtime.replaceAll("\\", "/");
+function formatFilterCommand(interpreter: string, scriptPath: string, mode: string, format: string): string {
+  const nodeExec = interpreter.replaceAll("\\", "/");
   const script = scriptPath.replaceAll("\\", "/");
   return `"${nodeExec}" "${script}" ${mode} ${format}`;
 }
@@ -194,12 +220,13 @@ export async function ensureFilter(dir: string, config: OmpSyncConfig = {}): Pro
     await fs.writeFile(scriptPath, source);
   }
 
+  const interpreter = resolveFilterInterpreter();
   const configs: Record<string, string> = {
-    "filter.omp-config-sync-yaml.clean": formatFilterCommand(scriptPath, "clean", "yaml"),
-    "filter.omp-config-sync-yaml.smudge": formatFilterCommand(scriptPath, "smudge", "yaml"),
+    "filter.omp-config-sync-yaml.clean": formatFilterCommand(interpreter, scriptPath, "clean", "yaml"),
+    "filter.omp-config-sync-yaml.smudge": formatFilterCommand(interpreter, scriptPath, "smudge", "yaml"),
     "filter.omp-config-sync-yaml.required": "false",
-    "filter.omp-config-sync-json.clean": formatFilterCommand(scriptPath, "clean", "json"),
-    "filter.omp-config-sync-json.smudge": formatFilterCommand(scriptPath, "smudge", "json"),
+    "filter.omp-config-sync-json.clean": formatFilterCommand(interpreter, scriptPath, "clean", "json"),
+    "filter.omp-config-sync-json.smudge": formatFilterCommand(interpreter, scriptPath, "smudge", "json"),
     "filter.omp-config-sync-json.required": "false",
   };
 
@@ -269,4 +296,85 @@ export async function refreshMachineSidecar(dir: string, config: OmpSyncConfig =
       await fs.writeFile(path.join(stateDir(dir), "config.machine.yml"), extracted.join("\n") + "\n");
     }
   } catch {}
+}
+
+interface YamlBlock {
+  key: string;
+  lines: string[];
+}
+
+/** Top-level `key:` blocks, including nested lines that belong to that key. */
+export function topLevelYamlBlocks(text: string): YamlBlock[] {
+  const blocks: YamlBlock[] = [];
+  let current: YamlBlock | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.trim() === "") {
+      if (current) current.lines.push(line);
+      continue;
+    }
+    const indent = line.search(/\S/);
+    const match = indent === 0 ? /^([^:#\s][^:]*):/.exec(line) : undefined;
+    if (match?.[1]) {
+      current = { key: match[1], lines: [line] };
+      blocks.push(current);
+      continue;
+    }
+    if (current && indent > 0) current.lines.push(line);
+  }
+  for (const block of blocks) {
+    while (block.lines.length > 1 && block.lines[block.lines.length - 1]?.trim() === "") block.lines.pop();
+  }
+  return blocks;
+}
+
+async function applyYamlSidecar(target: string, sidecarPath: string): Promise<void> {
+  let sidecarText: string;
+  let current: string;
+  try {
+    sidecarText = await fs.readFile(sidecarPath, "utf8");
+    current = await fs.readFile(target, "utf8");
+  } catch {
+    return;
+  }
+  const present = new Set(topLevelYamlBlocks(current).map((block) => block.key));
+  const missing = topLevelYamlBlocks(sidecarText).filter((block) => !present.has(block.key));
+  if (missing.length === 0) return;
+  const ending = current.includes("\r\n") ? "\r\n" : "\n";
+  const base = current.endsWith("\n") ? current : current + ending;
+  await fs.writeFile(target, base + missing.map((block) => block.lines.join(ending)).join(ending) + ending);
+}
+
+async function applyJsonSidecar(target: string, sidecarPath: string): Promise<void> {
+  try {
+    const sidecar = JSON.parse(await fs.readFile(sidecarPath, "utf8")) as unknown;
+    const parsed = JSON.parse(await fs.readFile(target, "utf8")) as unknown;
+    if (!sidecar || typeof sidecar !== "object" || Array.isArray(sidecar)) return;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const record = parsed as Record<string, unknown>;
+    let changed = false;
+    for (const [key, value] of Object.entries(sidecar)) {
+      if (!Object.hasOwn(record, key)) {
+        record[key] = value;
+        changed = true;
+      }
+    }
+    if (changed) await fs.writeFile(target, JSON.stringify(record, null, 2) + "\n");
+  } catch {}
+}
+
+/**
+ * Put machine-local keys back into the working tree.
+ *
+ * Committed copies have those keys stripped. A checkout restores them only when
+ * the smudge filter runs; `filter.required` is false, so a failed filter (for
+ * example git invoking the omp binary) leaves `setupVersion` out and omp
+ * onboards again. Merging the sidecar back does not depend on that filter.
+ * Keys already present in the working tree are left alone.
+ */
+export async function applyMachineSidecar(dir: string): Promise<void> {
+  const state = stateDir(dir);
+  const yamlSidecar = path.join(state, "config.machine.yml");
+  await applyYamlSidecar(path.join(dir, "config.yml"), yamlSidecar);
+  await applyYamlSidecar(path.join(dir, "config.yaml"), yamlSidecar);
+  await applyJsonSidecar(path.join(dir, "settings.json"), path.join(state, "settings.machine.json"));
 }
