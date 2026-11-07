@@ -1,0 +1,669 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { dirOf, readConfig } from "./config.js";
+import { applyMachineSidecar, ensureAttributes, ensureFilter, refreshMachineSidecar } from "./filter.js";
+import { DEFAULT_SYNC_REPO_NAME, defaultGh, LIKELY_SYNC_REPO_NAMES, parseRepoReference, remoteFromArg } from "./gh.js";
+import { countAheadBehind, fetchOrigin, getConflictState, getSyncDivergence, git, gitRaw, hasCommits, hasDotGit, hasLocalChanges, hasRemoteChanges, integrateUpstream, isRemoteReachable, isSyncableRepo, pushOrigin, upstreamRef, } from "./git.js";
+import { memorySnapshotHashes, restoreMemorySnapshots, writeMemorySnapshots } from "./memory.js";
+import { isSubagentChild, shouldAutoSync, shouldCheckRemote, withLock, writeSyncState } from "./lock.js";
+import { ensureIgnoreRules, ensureInfoExclude, isDenied, stagedSecretFiles, trackedSecretFiles, } from "./security.js";
+import { cacheVaultPassword, clearCachedVaultPassword, decryptPayload, deleteVaultFile, encryptPayload, getCachedVaultPassword, getVaultStatus, hasSensitiveChanges, hasVaultFile, hashSensitiveFiles, packSensitiveFiles, readVaultFile, saveSensitiveHash, SYNCABLE_SENSITIVE_FILES, unpackSensitiveFiles, writeVaultFile, } from "./vault.js";
+export const STATUS_KEY = "omp-git-sync";
+export function renderProgressBar(percentage, stage) {
+    const clamped = Math.max(0, Math.min(100, percentage));
+    const totalBars = 10;
+    const filledBars = Math.round((clamped / 100) * totalBars);
+    const emptyBars = totalBars - filledBars;
+    const bar = "█".repeat(filledBars) + "░".repeat(emptyBars);
+    return `🔄 Sync [${bar}] ${clamped}% ${stage}`;
+}
+export function updateSyncProgress(ctx, percentage, stage) {
+    if (ctx?.hasUI && ctx.ui) {
+        const text = renderProgressBar(percentage, stage);
+        ctx.ui.setStatus(STATUS_KEY, text);
+        if (typeof ctx.ui.setWorkingMessage === "function") {
+            ctx.ui.setWorkingMessage(text);
+        }
+    }
+}
+export function clearSyncProgress(ctx) {
+    if (ctx?.hasUI && ctx.ui) {
+        ctx.ui.setStatus(STATUS_KEY, undefined);
+        if (typeof ctx.ui.setWorkingMessage === "function") {
+            ctx.ui.setWorkingMessage(undefined);
+        }
+    }
+}
+function message(error) {
+    return error instanceof Error ? error.message : String(error);
+}
+function notify(ctx, text, level, deps) {
+    if (deps?.notify) {
+        deps.notify(text, level);
+    }
+    else if (ctx?.hasUI && ctx.ui) {
+        ctx.ui.notify(text, level);
+    }
+}
+export async function prepareCommit(deps, ctx) {
+    const config = await readConfig(deps, ctx);
+    const dir = dirOf(deps);
+    await ensureIgnoreRules(dir, config);
+    await ensureInfoExclude(dir);
+    await ensureAttributes(dir);
+    await ensureFilter(dir, config);
+    await refreshMachineSidecar(dir, config);
+    // Migration: earlier manual setups committed the live WAL databases. They are hard-denied and
+    // replaced by mnemopi.snap, so drop them from the index (the files on disk are kept).
+    const legacyDbs = (await git(["ls-files", "-z", "--", "memories/mnemopi"], dir)).stdout
+        .split("\0")
+        .filter((f) => f.endsWith("/mnemopi.db"));
+    if (legacyDbs.length) {
+        await git(["rm", "--cached", "-q", "--", ...legacyDbs], dir);
+    }
+    const memory = await writeMemorySnapshots(dir);
+    for (const err of memory.errors) {
+        notify(ctx, `omp-sync: could not snapshot memory db: ${err}`, "warning", deps);
+    }
+    // If vault is enabled and unlocked on this machine, update vault.enc ONLY IF sensitive files changed
+    const vaultStatus = await getVaultStatus(dir);
+    if (vaultStatus === "unlocked") {
+        const password = await getCachedVaultPassword(dir);
+        if (password && (await hasSensitiveChanges(dir))) {
+            const payload = await packSensitiveFiles(dir);
+            if (Object.keys(payload.files).length > 0) {
+                const encrypted = encryptPayload(payload, password);
+                await writeVaultFile(dir, encrypted);
+                const hash = await hashSensitiveFiles(dir);
+                if (hash) {
+                    await saveSensitiveHash(dir, hash);
+                }
+            }
+        }
+    }
+    return config;
+}
+export async function commitLocalChanges(deps, commitMessage, ctx) {
+    const dir = dirOf(deps);
+    await prepareCommit(deps, ctx);
+    const status = (await git(["status", "--porcelain"], dir)).stdout.trim();
+    if (!status)
+        return false;
+    await git(["add", "-A"], dir);
+    const bad = await stagedSecretFiles(dir);
+    if (bad.length) {
+        await git(["reset"], dir);
+        throw new Error(`REFUSED to commit sensitive paths: ${bad.join(", ")}. Remove with git rm --cached <file>.`);
+    }
+    const config = await readConfig(deps, ctx);
+    const suffix = config.includeHostname === false ? "" : ` from ${os.hostname()}`;
+    await git(["commit", "-m", commitMessage ?? `omp config: auto-sync${suffix}`], dir);
+    return true;
+}
+export async function runInit(arg, ctx, deps, options) {
+    const dir = dirOf(deps);
+    await fs.mkdir(dir, { recursive: true });
+    const isForce = /\b(--force|--fresh|-f)\b/i.test(arg);
+    const cleanArg = arg.replace(/\b(--force|--fresh|-f)\b/gi, "").trim();
+    if (await isSyncableRepo(dir)) {
+        const reachable = await isRemoteReachable(dir);
+        if (!isForce && reachable) {
+            throw new Error("already initialized with active remote; use '/ompsync sync' (or '/ompsync init --force' to start fresh)");
+        }
+        // Remote is deleted/unreachable or force requested: remove old origin
+        await git(["remote", "remove", "origin"], dir).catch(() => { });
+    }
+    // Check if vault encryption should be set up
+    let password = options?.password;
+    if (password === undefined && options?.enableVault !== false && ctx?.hasUI && ctx.ui) {
+        const wantVault = ctx.ui.confirm
+            ? await ctx.ui.confirm("Encrypted Credentials Sync", "Do you want to securely sync session tokens and login credentials with a password?")
+            : false;
+        if (wantVault && ctx.ui.input) {
+            const pass = await ctx.ui.input("Vault Passphrase", "Enter a passphrase to encrypt your credentials vault:");
+            if (pass && pass.trim()) {
+                password = pass.trim();
+            }
+        }
+    }
+    if (password) {
+        const payload = await packSensitiveFiles(dir);
+        const encrypted = encryptPayload(payload, password);
+        await writeVaultFile(dir, encrypted);
+        await cacheVaultPassword(dir, password);
+        const hash = await hashSensitiveFiles(dir);
+        if (hash) {
+            await saveSensitiveHash(dir, hash);
+        }
+    }
+    const config = await readConfig(deps, ctx);
+    await ensureIgnoreRules(dir, config);
+    if (!(await hasDotGit(dir))) {
+        await git(["init", "-b", "main"], dir);
+    }
+    await ensureInfoExclude(dir);
+    const tracked = await trackedSecretFiles(dir);
+    if (tracked.length) {
+        throw new Error(`tracked sensitive files: ${tracked.join(", ")}. Remove with git rm --cached <file>.`);
+    }
+    await commitLocalChanges(deps, "omp config: initial sync setup", ctx);
+    let remote = remoteFromArg(cleanArg, "");
+    if (!remote) {
+        const gh = deps?.gh ?? defaultGh;
+        if (!(await gh.available())) {
+            notify(ctx, "omp-sync: initial commit created. Create a private repo, then run /ompsync init <url>.", "warning", deps);
+            return;
+        }
+        const owner = await gh.currentUser();
+        const ref = parseRepoReference(cleanArg || DEFAULT_SYNC_REPO_NAME, owner);
+        if (!ref)
+            throw new Error(`invalid repository reference: ${cleanArg}`);
+        const id = `${ref.owner}/${ref.name}`;
+        if (!(await gh.repoExists(id))) {
+            await gh.createPrivateRepo(id);
+        }
+        remote = gh.remoteUrl(id);
+    }
+    const gh = deps?.gh ?? defaultGh;
+    if (await gh.available()) {
+        await gh.setupGit(dir);
+    }
+    await git(["remote", "add", "origin", remote], dir);
+    if (!(await pushOrigin(true, dir))) {
+        throw new Error("initial push failed");
+    }
+    notify(ctx, `omp-sync: initialized and pushed private repository (${password ? "with encrypted vault" : "config only"}).`, "info", deps);
+}
+async function defaultBranch(dir) {
+    try {
+        const { stdout } = await git(["ls-remote", "--symref", "origin", "HEAD"], dir);
+        const match = stdout.match(/ref: refs\/heads\/([^\s]+)\s+HEAD/);
+        return match?.[1] ?? "main";
+    }
+    catch {
+        return "main";
+    }
+}
+async function safeRenameBackup(target, backupPath) {
+    try {
+        await fs.rm(backupPath, { force: true });
+        await fs.rename(target, backupPath);
+    }
+    catch { }
+}
+async function backupConflicts(dir, branch) {
+    const { stdout } = await git(["ls-tree", "-r", "--name-only", "-z", `origin/${branch}`], dir);
+    const backups = [];
+    for (const rel of stdout.split("\0").filter(Boolean)) {
+        const target = path.join(dir, rel);
+        try {
+            await fs.lstat(target);
+        }
+        catch {
+            continue;
+        }
+        const local = await fs.readFile(target).catch(() => undefined);
+        const remote = await gitRaw(["show", `origin/${branch}:${rel}`], dir)
+            .then((x) => x.stdout)
+            .catch(() => undefined);
+        if (local && remote && !local.equals(remote)) {
+            const backupPath = `${target}.local-backup`;
+            await safeRenameBackup(target, backupPath);
+            backups.push(rel);
+        }
+    }
+    return backups;
+}
+export async function runLink(arg, ctx, deps, options) {
+    const dir = dirOf(deps);
+    const isForce = /\b(--force|--fresh|-f)\b/i.test(arg);
+    const cleanArg = arg.replace(/\b(--force|--fresh|-f)\b/gi, "").trim();
+    if (await isSyncableRepo(dir)) {
+        const reachable = await isRemoteReachable(dir);
+        if (!isForce && reachable) {
+            throw new Error("already linked; use '/ompsync sync' (or '/ompsync link <url> --force' to re-link)");
+        }
+        await git(["remote", "remove", "origin"], dir).catch(() => { });
+    }
+    const gh = deps?.gh ?? defaultGh;
+    let remote = remoteFromArg(cleanArg, "");
+    if (!remote) {
+        if (!(await gh.available())) {
+            notify(ctx, "omp-sync: provide a repo URL, or install and authenticate gh.", "warning", deps);
+            return;
+        }
+        const owner = await gh.currentUser();
+        for (const name of LIKELY_SYNC_REPO_NAMES) {
+            if (await gh.repoExists(`${owner}/${name}`)) {
+                remote = gh.remoteUrl(`${owner}/${name}`);
+                break;
+            }
+        }
+        if (!remote)
+            throw new Error("no sync repository found; provide its URL");
+    }
+    await fs.mkdir(dir, { recursive: true });
+    if ((await hasDotGit(dir)) && (await hasCommits(dir))) {
+        throw new Error(`existing git history in ${dir} has no 'origin' remote; backup or clean before linking`);
+    }
+    const config = await readConfig(deps, ctx);
+    if (!(await hasDotGit(dir))) {
+        await git(["init", "-b", "main"], dir);
+    }
+    await ensureIgnoreRules(dir, config);
+    await ensureInfoExclude(dir);
+    await ensureAttributes(dir);
+    await ensureFilter(dir, config);
+    await refreshMachineSidecar(dir, config);
+    if (await gh.available()) {
+        await gh.setupGit(dir);
+    }
+    await git(["remote", "add", "origin", remote], dir);
+    await git(["fetch", "origin"], dir);
+    const branch = await defaultBranch(dir);
+    const backups = await backupConflicts(dir, branch);
+    try {
+        await git(["checkout", "-B", branch, `origin/${branch}`], dir);
+    }
+    catch (error) {
+        const output = message(error);
+        const refused = output
+            .match(/would be overwritten by checkout:\n([\s\S]*?)Please move or remove/)?.[1]
+            ?.split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter(Boolean) ?? [];
+        for (const relative of refused) {
+            if (isDenied(relative))
+                continue;
+            const target = path.join(dir, relative);
+            const backupPath = `${target}.local-backup`;
+            await safeRenameBackup(target, backupPath);
+            backups.push(relative);
+        }
+        if (refused.length) {
+            try {
+                await git(["checkout", "-B", branch, `origin/${branch}`], dir);
+            }
+            catch (retry) {
+                throw new Error(`${message(retry)}\nResolve manually in ${dir}`);
+            }
+        }
+        else {
+            throw new Error(`${output}\nResolve manually in ${dir}`);
+        }
+    }
+    await git(["branch", "-u", `origin/${branch}`, branch], dir).catch(() => { });
+    await applyMachineSidecar(dir);
+    const restoredMemory = await restoreMemorySnapshots(dir);
+    if (restoredMemory.length) {
+        notify(ctx, `omp-sync: restored memory databases: ${restoredMemory.join(", ")}. Restart omp to load them.`, "info", deps);
+    }
+    // Handle encrypted vault if present
+    let vaultDecrypted = false;
+    const hasVault = await hasVaultFile(dir);
+    if (hasVault) {
+        let password = options?.password;
+        if (password === undefined && ctx?.hasUI && ctx.ui && ctx.ui.input) {
+            const entered = await ctx.ui.input("Encrypted Credentials Vault", "Remote repository contains an encrypted credentials vault. Enter passphrase to decrypt session tokens and login (or leave blank to skip):");
+            if (entered && entered.trim()) {
+                password = entered.trim();
+            }
+        }
+        if (password) {
+            const vaultRaw = await readVaultFile(dir);
+            if (vaultRaw) {
+                try {
+                    const payload = decryptPayload(vaultRaw, password);
+                    const restored = await unpackSensitiveFiles(dir, payload);
+                    await cacheVaultPassword(dir, password);
+                    vaultDecrypted = true;
+                    notify(ctx, `omp-sync: decrypted credentials vault and restored: ${restored.join(", ")}`, "info", deps);
+                }
+                catch {
+                    notify(ctx, "omp-sync: incorrect passphrase. Unencrypted config was linked. Run '/ompsync unlock' later.", "warning", deps);
+                }
+            }
+        }
+        else {
+            notify(ctx, "omp-sync: credentials vault is locked. Run '/ompsync unlock' when you wish to decrypt session tokens.", "info", deps);
+        }
+    }
+    const tracked = await trackedSecretFiles(dir);
+    if (tracked.length) {
+        notify(ctx, `omp-sync: remote tracks sensitive files: ${tracked.join(", ")}. Remove with git rm --cached <file>.`, "warning", deps);
+    }
+    notify(ctx, `omp-sync: linked — run /reload to apply pulled config.${backups.length ? ` Backed up: ${backups.join(", ")}.` : ""}${vaultDecrypted ? " (Vault restored)" : ""}`, "info", deps);
+}
+export async function showStatus(ctx, deps) {
+    const dir = dirOf(deps);
+    if (!(await isSyncableRepo(dir))) {
+        notify(ctx, `omp-sync: ${dir} is not initialized. Run /ompsync init.`, "warning", deps);
+        return;
+    }
+    const { branch, upstream, ahead, behind } = await getSyncDivergence(dir);
+    const dirty = (await git(["status", "--porcelain"], dir)).stdout.trim();
+    const bad = await trackedSecretFiles(dir);
+    const vaultStatus = await getVaultStatus(dir);
+    const conflicts = await getConflictState(dir);
+    const sensitiveChanged = vaultStatus === "unlocked" ? await hasSensitiveChanges(dir) : false;
+    let upstreamDesc = "no upstream configured";
+    if (upstream) {
+        if (ahead === 0 && behind === 0) {
+            upstreamDesc = `up to date with ${upstream}`;
+        }
+        else if (ahead > 0 && behind === 0) {
+            upstreamDesc = `ahead of ${upstream} by ${ahead} commit${ahead > 1 ? "s" : ""} (run /ompsync push)`;
+        }
+        else if (behind > 0 && ahead === 0) {
+            upstreamDesc = `behind ${upstream} by ${behind} commit${behind > 1 ? "s" : ""} (run /ompsync pull)`;
+        }
+        else {
+            upstreamDesc = `diverged: ahead ${ahead}, behind ${behind} (run /ompsync sync)`;
+        }
+    }
+    let vaultDesc = vaultStatus;
+    if (vaultStatus === "unlocked") {
+        const present = [];
+        for (const file of SYNCABLE_SENSITIVE_FILES) {
+            try {
+                await fs.access(path.join(dir, file));
+                present.push(file);
+            }
+            catch { }
+        }
+        const fileList = present.length ? ` [${present.join(", ")}]` : "";
+        vaultDesc = sensitiveChanged
+            ? `unlocked${fileList} (local credentials modified pending sync)`
+            : `unlocked${fileList} (synced)`;
+    }
+    else if (vaultStatus === "locked") {
+        vaultDesc = `locked (credentials encrypted in vault.enc — run '/ompsync unlock' to decrypt)`;
+    }
+    else {
+        vaultDesc = `disabled (unencrypted config only — run '/ompsync vault enable' to secure tokens)`;
+    }
+    const lines = [
+        `📁 Repository: ${dir}`,
+        `🌿 Branch: ${branch}`,
+        `🌐 Remote Sync: ${upstreamDesc}`,
+        `🔐 Vault Status: ${vaultDesc}`,
+        `📝 Local Changes: ${dirty || sensitiveChanged ? "uncommitted changes pending" : "working tree clean"}`,
+    ];
+    if (conflicts.hasConflicts) {
+        lines.push("");
+        lines.push(`⚠️ GIT CONFLICT / REBASE DETECTED:`);
+        if (conflicts.conflictedFiles.length) {
+            lines.push(`   Conflicted files: ${conflicts.conflictedFiles.join(", ")}`);
+        }
+        lines.push(`👉 How to resolve:`);
+        if (conflicts.conflictedFiles.includes("vault.enc")) {
+            lines.push(`   • To accept remote credentials vault (recommended):`);
+            lines.push(`     git checkout --theirs vault.enc && git add vault.enc`);
+            lines.push(`   • To keep your local machine credentials:`);
+            lines.push(`     git checkout --ours vault.enc && git add vault.enc`);
+        }
+        else {
+            lines.push(`   • To accept remote changes: git checkout --theirs <file> && git add <file>`);
+            lines.push(`   • To keep local changes:   git checkout --ours <file> && git add <file>`);
+        }
+        if (conflicts.inRebase) {
+            lines.push(`   • Complete rebase after resolving: git rebase --continue`);
+            lines.push(`   • Or abort rebase:                 git rebase --abort`);
+        }
+        else if (conflicts.inMerge) {
+            lines.push(`   • Complete merge after resolving:  git commit`);
+            lines.push(`   • Or abort merge:                  git merge --abort`);
+        }
+    }
+    if (bad.length) {
+        lines.push("");
+        lines.push(`🚨 SECURITY WARNING: Tracked sensitive files: ${bad.join(", ")}`);
+        lines.push(`   Remove from git index: git rm --cached <file>`);
+    }
+    notify(ctx, lines.join("\n"), conflicts.hasConflicts || bad.length ? "warning" : "info", deps);
+}
+export async function runReset(ctx, deps) {
+    const dir = dirOf(deps);
+    if (!(await isSyncableRepo(dir))) {
+        throw new Error(`no git repo in ${dir}. Run /ompsync init.`);
+    }
+    updateSyncProgress(ctx, 20, "Fetching remote repository...");
+    if (!(await fetchOrigin(dir))) {
+        throw new Error("failed to fetch from remote origin");
+    }
+    const branch = await defaultBranch(dir);
+    updateSyncProgress(ctx, 50, `Resetting to origin/${branch}...`);
+    // Smudge runs during reset --hard. Install a Node interpreter and drop any
+    // info/attributes `-filter` override first, so a leftover omp filter cannot
+    // skip setupVersion and force onboarding again.
+    const config = await readConfig(deps, ctx);
+    await ensureAttributes(dir);
+    await ensureFilter(dir, config);
+    // Discard all local changes, commits, and conflicts; force reset to remote branch
+    await git(["reset", "--hard", `origin/${branch}`], dir);
+    await git(["clean", "-fd"], dir).catch(() => { });
+    updateSyncProgress(ctx, 80, "Restoring configuration & vault...");
+    await ensureIgnoreRules(dir, config);
+    await ensureInfoExclude(dir);
+    await ensureAttributes(dir);
+    await ensureFilter(dir, config);
+    await applyMachineSidecar(dir);
+    await refreshMachineSidecar(dir, config);
+    await restoreMemorySnapshots(dir);
+    let vaultRestored = false;
+    const vaultStatus = await getVaultStatus(dir);
+    if (vaultStatus === "unlocked") {
+        const password = await getCachedVaultPassword(dir);
+        const vaultRaw = await readVaultFile(dir);
+        if (password && vaultRaw) {
+            try {
+                const payload = decryptPayload(vaultRaw, password);
+                await unpackSensitiveFiles(dir, payload);
+                vaultRestored = true;
+            }
+            catch { }
+        }
+    }
+    updateSyncProgress(ctx, 100, "Complete");
+    clearSyncProgress(ctx);
+    notify(ctx, `omp-sync: reset complete. Discarded all local changes and synced from origin/${branch}.${vaultRestored ? " (Credentials vault restored)" : ""} Run /reload to apply.`, "info", deps);
+}
+export async function runSync(ctx, options, deps) {
+    const dir = dirOf(deps);
+    if (!(await isSyncableRepo(dir))) {
+        if (!options.auto) {
+            notify(ctx, `omp-sync: no git repo with an 'origin' remote in ${dir}. Run /ompsync init.`, "warning", deps);
+        }
+        return;
+    }
+    const config = await readConfig(deps, ctx);
+    const discardLocal = options.discardLocal || config.preferRemote === true;
+    if (discardLocal) {
+        return runReset(ctx, deps);
+    }
+    updateSyncProgress(ctx, 10, "Preparing configuration...");
+    try {
+        await prepareCommit(deps, ctx);
+        const tracked = await trackedSecretFiles(dir);
+        if (tracked.length) {
+            notify(ctx, `omp-sync: tracked sensitive files: ${tracked.join(", ")}. Remove with git rm --cached.`, "warning", deps);
+        }
+        updateSyncProgress(ctx, 30, "Checking local changes...");
+        const changed = [];
+        if (await commitLocalChanges(deps, undefined, ctx)) {
+            changed.push("committed local changes");
+        }
+        if (!options.skipPull) {
+            updateSyncProgress(ctx, 50, "Fetching remote updates...");
+            if (!(await fetchOrigin(dir))) {
+                const reachable = await isRemoteReachable(dir);
+                if (!reachable) {
+                    notify(ctx, "omp-sync: remote repository is unreachable or was deleted on GitHub. Run '/ompsync init' to recreate it.", "warning", deps);
+                }
+                else if (!options.auto) {
+                    notify(ctx, "omp-sync: fetch failed; skipped pull/push.", "warning", deps);
+                }
+                return;
+            }
+            const upstream = (await upstreamRef(dir)) ?? `origin/${await defaultBranch(dir)}`;
+            if (upstream) {
+                const { behind } = await countAheadBehind(upstream, dir).catch(() => ({ behind: 0, ahead: 0 }));
+                if (behind > 0) {
+                    const memoryBefore = await memorySnapshotHashes(dir);
+                    updateSyncProgress(ctx, 70, "Integrating remote changes...");
+                    if (!(await integrateUpstream(upstream, dir))) {
+                        if (config.discardLocalOnConflict) {
+                            await git(["rebase", "--abort"], dir).catch(() => { });
+                            return runReset(ctx, deps);
+                        }
+                        throw new Error(`local and remote diverged with conflicts; rebase aborted in ${dir}. Run '/ompsync reset' to discard local changes and sync from remote.`);
+                    }
+                    await applyMachineSidecar(dir);
+                    changed.push("pulled updates");
+                    const restoredMemory = await restoreMemorySnapshots(dir, [...(await memorySnapshotHashes(dir))].filter(([rel, hash]) => memoryBefore.get(rel) !== hash).map(([rel]) => rel));
+                    if (restoredMemory.length)
+                        changed.push(`restored memory (${restoredMemory.length} db, restart omp to load)`);
+                    // If remote updated vault.enc and we have a cached password, update local credentials
+                    const vaultStatus = await getVaultStatus(dir);
+                    if (vaultStatus === "unlocked") {
+                        const password = await getCachedVaultPassword(dir);
+                        const vaultRaw = await readVaultFile(dir);
+                        if (password && vaultRaw) {
+                            try {
+                                const payload = decryptPayload(vaultRaw, password);
+                                await unpackSensitiveFiles(dir, payload);
+                            }
+                            catch { }
+                        }
+                    }
+                }
+            }
+        }
+        if (options.push) {
+            updateSyncProgress(ctx, 90, "Pushing changes to remote...");
+            const upstream = (await upstreamRef(dir)) ?? `origin/${await defaultBranch(dir)}`;
+            let pushed = false;
+            const { ahead } = await countAheadBehind(upstream, dir).catch(() => ({ ahead: 1, behind: 0 }));
+            if (ahead > 0) {
+                pushed = await pushOrigin(false, dir);
+                // Push rejected (race condition where remote was updated concurrently)
+                if (!pushed) {
+                    updateSyncProgress(ctx, 92, "Remote advanced, reconciling changes...");
+                    if (await fetchOrigin(dir)) {
+                        if (await integrateUpstream(upstream, dir)) {
+                            await applyMachineSidecar(dir);
+                            pushed = await pushOrigin(false, dir);
+                        }
+                    }
+                }
+            }
+            else if (!upstreamRef(dir)) {
+                pushed = await pushOrigin(true, dir);
+            }
+            if (pushed)
+                changed.push("pushed");
+        }
+        updateSyncProgress(ctx, 100, "Complete");
+        if (changed.some((x) => x.startsWith("pulled"))) {
+            notify(ctx, `omp-sync: ${changed.join(", ")}. Run /reload to apply pulled config.`, "info", deps);
+        }
+        else if (!options.auto) {
+            notify(ctx, changed.length ? `omp-sync: ${changed.join(", ")}.` : "omp-sync: already up to date.", "info", deps);
+        }
+    }
+    finally {
+        clearSyncProgress(ctx);
+    }
+}
+export async function checkAndBackgroundSync(ctx, deps) {
+    const dir = dirOf(deps);
+    if (isSubagentChild() || !(await isSyncableRepo(dir)))
+        return false;
+    if (!(await shouldAutoSync(deps)))
+        return false;
+    const localChanges = await hasLocalChanges(dir);
+    const checkRemote = localChanges || (await shouldCheckRemote(deps));
+    if (!localChanges && !checkRemote)
+        return false;
+    const hasChanges = localChanges || (await hasRemoteChanges(dir));
+    if (checkRemote) {
+        await writeSyncState({ lastRemoteCheckAt: new Date().toISOString() }, dir).catch(() => { });
+    }
+    if (!hasChanges)
+        return false;
+    const ran = await withLock(ctx, async () => {
+        await writeSyncState({ lastAutoSyncAt: new Date().toISOString(), lastRemoteCheckAt: new Date().toISOString() }, dir);
+        await runSync(ctx, { auto: true, push: true }, deps);
+        return true;
+    }, deps);
+    return ran === true;
+}
+export async function runUnlockVault(passwordArg, ctx, deps) {
+    const dir = dirOf(deps);
+    if (!(await hasVaultFile(dir))) {
+        throw new Error("No encrypted vault file (vault.enc) found. Use '/ompsync vault enable' to create one.");
+    }
+    let password = passwordArg;
+    if (!password && ctx?.hasUI && ctx.ui && ctx.ui.input) {
+        const entered = await ctx.ui.input("Unlock Vault", "Enter passphrase to decrypt credentials vault:");
+        if (entered && entered.trim()) {
+            password = entered.trim();
+        }
+    }
+    if (!password) {
+        throw new Error("Passphrase required to unlock vault.");
+    }
+    const raw = await readVaultFile(dir);
+    if (!raw)
+        throw new Error("Vault file is empty.");
+    const payload = decryptPayload(raw, password);
+    const restored = await unpackSensitiveFiles(dir, payload);
+    await cacheVaultPassword(dir, password);
+    notify(ctx, `omp-sync: vault unlocked. Restored: ${restored.join(", ")}`, "info", deps);
+}
+export async function runEnableVault(passwordArg, ctx, deps) {
+    const dir = dirOf(deps);
+    let password = passwordArg;
+    if (!password && ctx?.hasUI && ctx.ui && ctx.ui.input) {
+        const entered = await ctx.ui.input("Enable Vault", "Enter passphrase to encrypt credentials vault:");
+        if (entered && entered.trim()) {
+            password = entered.trim();
+        }
+    }
+    if (!password) {
+        throw new Error("Passphrase required to enable vault.");
+    }
+    const payload = await packSensitiveFiles(dir);
+    const encrypted = encryptPayload(payload, password);
+    await writeVaultFile(dir, encrypted);
+    await cacheVaultPassword(dir, password);
+    const hash = await hashSensitiveFiles(dir);
+    if (hash) {
+        await saveSensitiveHash(dir, hash);
+    }
+    if (await isSyncableRepo(dir)) {
+        await commitLocalChanges(deps, "omp config: enable encrypted credentials vault", ctx);
+        const upstream = await upstreamRef(dir);
+        await pushOrigin(!upstream, dir);
+    }
+    notify(ctx, "omp-sync: encrypted credentials vault enabled and saved.", "info", deps);
+}
+export async function runDisableVault(ctx, deps) {
+    const dir = dirOf(deps);
+    await deleteVaultFile(dir);
+    await clearCachedVaultPassword(dir);
+    if (await isSyncableRepo(dir)) {
+        await git(["rm", "-f", "vault.enc"], dir).catch(() => { });
+        await commitLocalChanges(deps, "omp config: disable encrypted credentials vault", ctx);
+        const upstream = await upstreamRef(dir);
+        await pushOrigin(!upstream, dir);
+    }
+    notify(ctx, "omp-sync: credentials vault disabled and removed from sync.", "info", deps);
+}
+export async function runLockVault(ctx, deps) {
+    const dir = dirOf(deps);
+    await clearCachedVaultPassword(dir);
+    notify(ctx, "omp-sync: credentials vault locked on this machine.", "info", deps);
+}
+//# sourceMappingURL=sync.js.map

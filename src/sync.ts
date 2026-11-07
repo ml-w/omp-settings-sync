@@ -107,7 +107,8 @@ export async function prepareCommit(deps?: Deps, ctx?: Ctx) {
   // replaced by mnemopi.snap, so drop them from the index (the files on disk are kept).
   const legacyDbs = (await git(["ls-files", "-z", "--", "memories/mnemopi"], dir)).stdout
     .split("\0")
-    .filter((f) => f.endsWith("/mnemopi.db"));
+    .filter(Boolean)
+    .filter(isDenied);
   if (legacyDbs.length) {
     await git(["rm", "--cached", "-q", "--", ...legacyDbs], dir);
   }
@@ -652,7 +653,7 @@ export async function runSync(
 
       const upstream = (await upstreamRef(dir)) ?? `origin/${await defaultBranch(dir)}`;
       if (upstream) {
-        const { behind } = await countAheadBehind(upstream, dir).catch(() => ({ behind: 0, ahead: 0 }));
+        const { behind } = await countAheadBehind(upstream, dir);
         if (behind > 0) {
           const memoryBefore = await memorySnapshotHashes(dir);
           updateSyncProgress(ctx, 70, "Integrating remote changes...");
@@ -691,7 +692,7 @@ export async function runSync(
       updateSyncProgress(ctx, 90, "Pushing changes to remote...");
       const upstream = (await upstreamRef(dir)) ?? `origin/${await defaultBranch(dir)}`;
       let pushed = false;
-      const { ahead } = await countAheadBehind(upstream, dir).catch(() => ({ ahead: 1, behind: 0 }));
+      const { ahead } = await countAheadBehind(upstream, dir);
       if (ahead > 0) {
         pushed = await pushOrigin(false, dir);
         // Push rejected (race condition where remote was updated concurrently)
@@ -704,7 +705,7 @@ export async function runSync(
             }
           }
         }
-      } else if (!upstreamRef(dir)) {
+      } else if (!(await upstreamRef(dir))) {
         pushed = await pushOrigin(true, dir);
       }
       if (pushed) changed.push("pushed");
@@ -727,31 +728,46 @@ export async function checkAndBackgroundSync(ctx: Ctx, deps?: Deps): Promise<boo
   const dir = dirOf(deps);
   if (isSubagentChild() || !(await isSyncableRepo(dir))) return false;
 
-  if (!(await shouldAutoSync(deps))) return false;
-
   const localChanges = await hasLocalChanges(dir);
-  const checkRemote = localChanges || (await shouldCheckRemote(deps));
+  const autoSyncAllowed = await shouldAutoSync(deps);
 
-  if (!localChanges && !checkRemote) return false;
+  // If we have local changes, we ONLY proceed if auto-sync is allowed.
+  if (localChanges) {
+    if (!autoSyncAllowed) return false;
 
-  const hasChanges = localChanges || (await hasRemoteChanges(dir));
-  if (checkRemote) {
-    await writeSyncState({ lastRemoteCheckAt: new Date().toISOString() }, dir).catch(() => {});
+    const ran = await withLock(
+      ctx,
+      async () => {
+        await writeSyncState({ lastAutoSyncAt: new Date().toISOString(), lastRemoteCheckAt: new Date().toISOString() }, dir);
+        await runSync(ctx, { auto: true, push: true }, deps);
+        return true;
+      },
+      deps
+    );
+    return ran === true;
   }
 
-  if (!hasChanges) return false;
+  // If no local changes, check remote if stale.
+  const checkRemote = await shouldCheckRemote(deps);
+  if (checkRemote) {
+    const hasRemote = await hasRemoteChanges(dir);
+    await writeSyncState({ lastRemoteCheckAt: new Date().toISOString() }, dir).catch(() => {});
 
-  const ran = await withLock(
-    ctx,
-    async () => {
-      await writeSyncState({ lastAutoSyncAt: new Date().toISOString(), lastRemoteCheckAt: new Date().toISOString() }, dir);
-      await runSync(ctx, { auto: true, push: true }, deps);
-      return true;
-    },
-    deps
-  );
+    if (hasRemote) {
+      const ran = await withLock(
+        ctx,
+        async () => {
+          await writeSyncState({ lastAutoSyncAt: new Date().toISOString(), lastRemoteCheckAt: new Date().toISOString() }, dir);
+          await runSync(ctx, { auto: true, push: true }, deps);
+          return true;
+        },
+        deps
+      );
+      return ran === true;
+    }
+  }
 
-  return ran === true;
+  return false;
 }
 
 

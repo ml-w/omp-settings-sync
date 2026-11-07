@@ -72,8 +72,9 @@ export function isDenied(file: string): boolean {
   const parts = normalized.split("/").filter(Boolean);
   const basename = parts[parts.length - 1] ?? "";
 
-  // The encrypted vault is explicitly safe and permitted to sync
-  if (basename === "vault.enc" || basename === ".vault.enc") {
+  // The encrypted vault and memory snapshots are explicitly safe to sync.
+  // We block the live .db files and their WAL/journal sidecars.
+  if (basename === "vault.enc" || basename === ".vault.enc" || basename === "mnemopi.snap") {
     return false;
   }
 

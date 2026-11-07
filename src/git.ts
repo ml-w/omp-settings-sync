@@ -117,14 +117,21 @@ export async function integrateUpstream(upstream: string, dir: string): Promise<
   try {
     await git(["merge", "--ff-only", upstream], dir);
     return true;
-  } catch {}
+  } catch (e) {
+    // If merge failed due to lock or other non-divergence issues, don't just fall through to rebase
+    const err = String(e);
+    if (err.includes("index.lock") || err.includes("not a git repository")) throw e;
+  }
   try {
     await git(["rebase", upstream], dir);
     return true;
-  } catch {
+  } catch (e) {
+    const err = String(e);
     try {
       await git(["rebase", "--abort"], dir);
     } catch {}
+    // Re-throw if it wasn't a conflict (e.g. lock, network, etc)
+    if (err.includes("index.lock") || err.includes("not a git repository")) throw e;
     return false;
   }
 }
