@@ -63,6 +63,7 @@ export const HARD_DENY_PATTERNS = [
   "wt/",
   ".git-sync/",
   "last-changelog-version",
+  "*.snapshot",
   "**/node_modules/",
   ".DS_Store",
 ];
@@ -113,7 +114,8 @@ export function isDenied(file: string): boolean {
     basename.includes(".db-") ||
     basename.includes(".db.") ||
     basename.endsWith(".sqlite") ||
-    basename.endsWith(".sqlite3")
+    basename.endsWith(".sqlite3") ||
+    basename.endsWith(".snapshot")
   ) {
     return true;
   }

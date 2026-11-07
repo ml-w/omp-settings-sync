@@ -29,6 +29,8 @@ test("isDenied blocks all secrets, databases, runtime state, and local credentia
     "config.local.yml",
     "mcp.local.json",
     "node_modules/pkg/index.js",
+    "predict/ngram/ngram.snapshot",
+    "memories/state.snapshot",
   ];
   for (const file of blocked) {
     assert.ok(isDenied(file), `Expected denied: ${file}`);

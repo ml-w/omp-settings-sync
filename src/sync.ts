@@ -111,6 +111,14 @@ export async function prepareCommit(deps?: Deps, ctx?: Ctx) {
   if (legacyDbs.length) {
     await git(["rm", "--cached", "-q", "--", ...legacyDbs], dir);
   }
+
+  // Migration: previously committed snapshots (e.g. predict/ngram/*.snapshot) should be untracked
+  const trackedSnapshots = (await git(["ls-files", "-z"], dir)).stdout
+    .split("\0")
+    .filter((f) => f.endsWith(".snapshot"));
+  if (trackedSnapshots.length) {
+    await git(["rm", "--cached", "-q", "--", ...trackedSnapshots], dir);
+  }
   const memory = await writeMemorySnapshots(dir);
   for (const err of memory.errors) {
     notify(ctx, `omp-sync: could not snapshot memory db: ${err}`, "warning", deps);
@@ -138,8 +146,11 @@ export async function prepareCommit(deps?: Deps, ctx?: Ctx) {
 
 export async function commitLocalChanges(deps?: Deps, commitMessage?: string, ctx?: Ctx): Promise<boolean> {
   const dir = dirOf(deps);
+  const conflicts = await getConflictState(dir);
+  if (conflicts.hasConflicts) {
+    throw new Error(`cannot commit while in conflict or rebase/merge state in ${dir}`);
+  }
   await prepareCommit(deps, ctx);
-
   const status = (await git(["status", "--porcelain"], dir)).stdout.trim();
   if (!status) return false;
 
@@ -612,6 +623,14 @@ export async function runSync(
 
   if (discardLocal) {
     return runReset(ctx, deps);
+  }
+
+  const conflicts = await getConflictState(dir);
+  if (conflicts.hasConflicts) {
+    if (config.discardLocalOnConflict) {
+      return runReset(ctx, deps);
+    }
+    throw new Error(`cannot sync while in conflict or rebase/merge state in ${dir}. Run '/ompsync reset' to discard local changes and sync from remote, or resolve conflicts first.`);
   }
 
   updateSyncProgress(ctx, 10, "Preparing configuration...");

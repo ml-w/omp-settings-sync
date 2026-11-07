@@ -3,5 +3,6 @@ dist/
 dist-test/
 *.log
 .DS_Store
+*.snapshot
 source/
 .git-sync/
